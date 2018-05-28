@@ -1,16 +1,27 @@
 {
-  "pluginType": "datasource",
-  "name": "InfluxDB 0.9.x",
+  "type": "datasource",
+  "name": "InfluxDB",
+  "id": "influxdb",
 
-  "type": "influxdb",
-  "serviceName": "InfluxDatasource",
+  "defaultMatchFormat": "regex values",
+  "metrics": true,
+  "annotations": true,
+  "alerting": true,
 
-  "module": "plugins/datasource/influxdb/datasource",
-
-  "partials": {
-    "config": "app/plugins/datasource/influxdb/partials/config.html"
+  "queryOptions": {
+    "minInterval": true
   },
 
-  "metrics": true,
-  "annotations": true
+  "info": {
+    "description": "InfluxDB Data Source for Grafana",
+    "author": {
+      "name": "Grafana Project",
+      "url": "https://grafana.com"
+    },
+    "logos": {
+      "small": "img/influxdb_logo.svg",
+      "large": "img/influxdb_logo.svg"
+    },
+    "version": "5.0.0"
+  }
 }

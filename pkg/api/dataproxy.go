@@ -1,83 +1,59 @@
 package api
 
 import (
-	"crypto/tls"
-	"net"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
+	"fmt"
 	"time"
 
+	"github.com/grafana/grafana/pkg/api/pluginproxy"
 	"github.com/grafana/grafana/pkg/bus"
-	"github.com/grafana/grafana/pkg/middleware"
+	"github.com/grafana/grafana/pkg/metrics"
 	m "github.com/grafana/grafana/pkg/models"
-	"github.com/grafana/grafana/pkg/util"
+	"github.com/grafana/grafana/pkg/plugins"
 )
 
-var dataProxyTransport = &http.Transport{
-	TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	Proxy:           http.ProxyFromEnvironment,
-	Dial: (&net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).Dial,
-	TLSHandshakeTimeout: 10 * time.Second,
-}
+const HeaderNameNoBackendCache = "X-Grafana-NoCache"
 
-func NewReverseProxy(ds *m.DataSource, proxyPath string) *httputil.ReverseProxy {
-	target, _ := url.Parse(ds.Url)
+func (hs *HTTPServer) getDatasourceByID(id int64, orgID int64, nocache bool) (*m.DataSource, error) {
+	cacheKey := fmt.Sprintf("ds-%d", id)
 
-	director := func(req *http.Request) {
-		req.URL.Scheme = target.Scheme
-		req.URL.Host = target.Host
-		req.Host = target.Host
-
-		reqQueryVals := req.URL.Query()
-
-		if ds.Type == m.DS_INFLUXDB_08 {
-			req.URL.Path = util.JoinUrlFragments(target.Path, "db/"+ds.Database+"/"+proxyPath)
-			reqQueryVals.Add("u", ds.User)
-			reqQueryVals.Add("p", ds.Password)
-			req.URL.RawQuery = reqQueryVals.Encode()
-		} else if ds.Type == m.DS_INFLUXDB {
-			req.URL.Path = util.JoinUrlFragments(target.Path, proxyPath)
-			reqQueryVals.Add("db", ds.Database)
-			req.URL.RawQuery = reqQueryVals.Encode()
-			if !ds.BasicAuth {
-				req.Header.Add("Authorization", util.GetBasicAuthHeader(ds.User, ds.Password))
+	if !nocache {
+		if cached, found := hs.cache.Get(cacheKey); found {
+			ds := cached.(*m.DataSource)
+			if ds.OrgId == orgID {
+				return ds, nil
 			}
-		} else {
-			req.URL.Path = util.JoinUrlFragments(target.Path, proxyPath)
 		}
-
-		if ds.BasicAuth {
-			req.Header.Add("Authorization", util.GetBasicAuthHeader(ds.BasicAuthUser, ds.BasicAuthPassword))
-		}
-
-		// clear cookie headers
-		req.Header.Del("Cookie")
-		req.Header.Del("Set-Cookie")
 	}
 
-	return &httputil.ReverseProxy{Director: director}
+	query := m.GetDataSourceByIdQuery{Id: id, OrgId: orgID}
+	if err := bus.Dispatch(&query); err != nil {
+		return nil, err
+	}
+
+	hs.cache.Set(cacheKey, query.Result, time.Second*5)
+	return query.Result, nil
 }
 
-//ProxyDataSourceRequest TODO need to cache datasources
-func ProxyDataSourceRequest(c *middleware.Context) {
-	id := c.ParamsInt64(":id")
-	query := m.GetDataSourceByIdQuery{Id: id, OrgId: c.OrgId}
+func (hs *HTTPServer) ProxyDataSourceRequest(c *m.ReqContext) {
+	c.TimeRequest(metrics.M_DataSource_ProxyReq_Timer)
 
-	if err := bus.Dispatch(&query); err != nil {
+	nocache := c.Req.Header.Get(HeaderNameNoBackendCache) == "true"
+
+	ds, err := hs.getDatasourceByID(c.ParamsInt64(":id"), c.OrgId, nocache)
+
+	if err != nil {
 		c.JsonApiErr(500, "Unable to load datasource meta data", err)
 		return
 	}
 
-	if query.Result.Type == m.DS_CLOUDWATCH {
-		ProxyCloudWatchDataSourceRequest(c)
-	} else {
-		proxyPath := c.Params("*")
-		proxy := NewReverseProxy(&query.Result, proxyPath)
-		proxy.Transport = dataProxyTransport
-		proxy.ServeHTTP(c.RW(), c.Req.Request)
+	// find plugin
+	plugin, ok := plugins.DataSources[ds.Type]
+	if !ok {
+		c.JsonApiErr(500, "Unable to find datasource plugin", err)
+		return
 	}
+
+	proxyPath := c.Params("*")
+	proxy := pluginproxy.NewDataSourceProxy(ds, plugin, c, proxyPath)
+	proxy.HandleRequest()
 }
